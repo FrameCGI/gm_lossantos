@@ -1,4 +1,8 @@
 <center>
+<img src="downloading.png" alt="HOW TO INSTALL">
+</center>
+
+<center>
     <img src="icon.png" alt="gm_lossantos">
 </center>
 <hr>
