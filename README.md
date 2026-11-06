@@ -15,4 +15,4 @@
 <p>this addon streams from disc, so its a lot more performant and easy on memory</p>
 <small>note: it's still very unperformant in lots of dense city areas, tried to patch that out but okay :(</small>
 
-<p>the installer code is in <code>winformsshit/</code>, along with exporter code in <code>exporter/</code>. gmod addon code is in <code>addon/</code></p>
+<p>the installer code is in <code>winformsshit/</code>, along with exporter code in <code>native/</code>. gmod addon code is in <code>addon/</code></p>
