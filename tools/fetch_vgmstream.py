@@ -7,7 +7,7 @@ import zipfile
 TAG = 'r2117'
 ZIP = 'https://github.com/vgmstream/vgmstream/releases/download/%s/vgmstream-win64.zip' % TAG
 ZIP_SHA = '6c4a8a3813864fefed081bbd337dbc0ad93bf88e0b92f5db98d7ab258b22dc6c'
-OUT = r'C:\Users\Frame\Downloads\openworld_work\vgmstream'
+OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'openworld_work', 'vgmstream')
 
 
 def main():

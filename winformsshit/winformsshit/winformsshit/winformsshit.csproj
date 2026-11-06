@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
@@ -20,7 +20,7 @@
     <None Include="$(LosSantosNative)\lossantos_install.dll" Link="lossantos_install.dll" CopyToOutputDirectory="PreserveNewest" Visible="false" />
     <None Include="$(LosSantosNative)\gtav_bake.exe" Link="gtav_bake.exe" CopyToOutputDirectory="PreserveNewest" Visible="false" />
     <None Include="$(LosSantosNative)\payload\*" Link="payload\%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" Visible="false" />
-    <None Include="$(LosSantosVgmstream)\*.exe;$(LosSantosVgmstream)\*.dll;$(LosSantosVgmstream)\COPYING" Link="vgmstream\%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" Visible="false" />
+    <None Include="$(LosSantosVgmstream)\*.exe;$(LosSantosVgmstream)\*.dll;$(LosSantosVgmstream)\COPYIN*" Link="vgmstream\%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" Visible="false" />
     <None Include="$(LOCALAPPDATA)\Microsoft\WinGet\Packages\Gyan.FFmpeg*\ffmpeg-*\bin\ffmpeg.exe" Link="ffmpeg\ffmpeg.exe" CopyToOutputDirectory="PreserveNewest" Visible="false" />
   </ItemGroup>
 
