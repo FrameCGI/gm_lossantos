@@ -82,8 +82,7 @@ function GTAV.GetEntityCell(ent)
 	return ent:GetNW2Vector("WorldCell", Vector(0, 0, 0))
 end
 
-function GTAV.SetEntityCell(ent, cell)
-	ent:SetNW2Vector("WorldCell", cell)
+function GTAV.ApplyCellKey(ent, cell)
 	local key = GTAV.GetCellKey(cell)
 	if ent.WorldCellKey ~= key then
 		ent.WorldCellKey = key
@@ -94,10 +93,25 @@ function GTAV.SetEntityCell(ent, cell)
 	return key
 end
 
+function GTAV.SetEntityCell(ent, cell)
+	ent.gtavCell = Vector(cell.x, cell.y, cell.z)
+	ent:SetNW2Vector("WorldCell", cell)
+	return GTAV.ApplyCellKey(ent, cell)
+end
+
+-- everything overlaps in real space, this is what keeps cells apart
+-- same trick as https://github.com/meetric1/gmod-infinite-map
 function GTAV.ShouldCollide(entA, entB)
 	local a = entA.WorldCellKey
 	local b = entB.WorldCellKey
 	if a and b and a ~= b then return false end
+end
+hook.Add("ShouldCollide", "GTAV_CellCollision", GTAV.ShouldCollide)
+
+if CLIENT then
+	hook.Add("EntityNetworkedVarChanged", "GTAV_CellChanged", function(ent, name, _, cell)
+		if name == "WorldCell" then GTAV.ApplyCellKey(ent, cell) end
+	end)
 end
 
 -- distance squared (avoids sqrt)
@@ -365,7 +379,7 @@ function GTAV.Deactivate()
 			S.ActiveChunks = {}
 			S.TrackedProps = {}
 			S.ChunkPoolFree = {}
-			S.Frame = Vector(0, 0, 0)
+			S.DefaultCell = Vector(0, 0, 0)
 			S.nextChunkTick = 0
 			S.nextShiftTick = 0
 		end

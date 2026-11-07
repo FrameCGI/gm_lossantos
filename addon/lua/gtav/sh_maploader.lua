@@ -72,10 +72,6 @@ if SERVER then
 			if GTAV.Server and GTAV.Server.Initialize then
 				GTAV.Server.Initialize()
 			end
-			local spawn = GTAV.MapData.spawn or Vector(0, 0, 200)
-			if GTAV.Server and GTAV.Server.SetFrame then
-				GTAV.Server.SetFrame(GTAV.SnapCell(spawn))
-			end
 			for _, ply in ipairs(player.GetAll()) do
 				if GTAV.Server and GTAV.Server.ResetPlayer then
 					GTAV.Server.ResetPlayer(ply)
@@ -87,6 +83,7 @@ if SERVER then
 	end)
 
 	concommand.Add("gtav_loadmap", function(ply, cmd, args)
+		if IsValid(ply) and not ply:IsAdmin() then return end
 		local mapName = args[1] or GTAV.DeriveMapName()
 		if not TryActivate(mapName, "gtav_loadmap") then
 			print("[GTAV] Failed to load map: " .. mapName)
@@ -107,10 +104,6 @@ if SERVER then
 
 		if S.Initialize then S.Initialize() end
 
-		local spawn = GTAV.MapData.spawn or Vector(0, 0, 200)
-		if S.SetFrame then
-			S.SetFrame(GTAV.SnapCell(spawn))
-		end
 		for _, p in ipairs(player.GetAll()) do
 			if S.ResetPlayer then S.ResetPlayer(p) end
 		end

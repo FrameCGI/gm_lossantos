@@ -3154,6 +3154,26 @@ hook.Add("Think", "GTAV_StateLog", function()
 	print(string.format("  ground %d %d is not loaded", cx, cy))
 end)
 
+-- no ghost footsteps from whoever is standing in the same real spot
+hook.Add("EntityEmitSound", "GTAV_CellSound", function(data)
+	local ent = data.Entity
+	local me = LocalPlayer()
+	if not GTAV.MapData.current or not IsValid(ent) or not IsValid(me) then return end
+	if ent.WorldCellKey and ent.WorldCellKey ~= me.WorldCellKey then
+		data.Pos = (data.Pos or ent:GetPos()) + (ent.RenderOffset or vector_origin)
+		return true
+	end
+end)
+
+hook.Add("EntityFireBullets", "GTAV_CellTracers", function(ent, bullet)
+	local me = LocalPlayer()
+	if not GTAV.MapData.current or not IsValid(me) then return end
+	if ent.WorldCellKey and ent.WorldCellKey ~= me.WorldCellKey then
+		bullet.Tracer = 0
+		return true
+	end
+end)
+
 hook.Add("OnEntityCreated", "GTAV_GroundCreated", function(ent)
 	if not IsValid(ent) or ent:GetClass() ~= "gtav_ground" then return end
 	C.NextGroundBuild = 0
@@ -3197,6 +3217,7 @@ function C.CrossCellEntities()
 
 	-- draw frame not the netvar
 	local myCell = C.RenderCell or me:GetNW2Vector("WorldCell", Vector(0, 0, 0))
+	local multi = false
 
 	for _, ent in ipairs(ents.GetAll()) do
 		if ent ~= me and not ent:IsWorld() and not ent.IsGTAVGround then
@@ -3204,6 +3225,7 @@ function C.CrossCellEntities()
 			local diff = entCell - myCell
 
 			if diff.x ~= 0 or diff.y ~= 0 or diff.z ~= 0 then
+				multi = true
 				if ent.RenderOffset ~= diff then
 					if not ent.gtavOrigRenderOverride then
 						ent.gtavOrigRenderOverride = ent.RenderOverride
@@ -3216,21 +3238,24 @@ function C.CrossCellEntities()
 				ent.RenderOffset = nil
 				ent.RenderOverride = ent.gtavOrigRenderOverride
 				ent.gtavOrigRenderOverride = nil
-				ent:SetRenderBounds(Vector(-100, -100, -100), Vector(100, 100, 100))
+				local mins, maxs = ent:GetModelRenderBounds()
+				if mins and maxs then ent:SetRenderBounds(mins, maxs) end
 			end
 		end
 	end
+	GTAV.MultiCell = multi
 end
 
+-- move the camera not the model, infmap does the same
 function C.ShiftedRender(ent, flags)
 	local offset = ent.RenderOffset
-	if offset then
-		local m = Matrix()
-		m:SetTranslation(offset)
-		cam.PushModelMatrix(m)
+	if not offset then
+		ent:DrawModel(flags)
+		return
 	end
+	cam.Start3D(EyePos() - offset)
 	ent:DrawModel(flags)
-	if offset then cam.PopModelMatrix() end
+	cam.End3D()
 end
 
 

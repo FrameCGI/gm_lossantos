@@ -6,11 +6,12 @@ util.AddNetworkString("GTAV_Respawn")
 GTAV.Server = GTAV.Server or {}
 local S = GTAV.Server
 
-S.Frame = S.Frame or Vector(0, 0, 0)          -- current floating-origin cell
-S.ActiveChunks = S.ActiveChunks or {}          -- ["cx cy"] = ground entity
+S.DefaultCell = S.DefaultCell or Vector(0, 0, 0)   -- anything never labelled lives here
+S.ActiveChunks = S.ActiveChunks or {}          -- ["cx cy|cell"] = ground entity
+S.Held = S.Held or {}                          -- player -> what theyre carrying
 S.TrackedProps = S.TrackedProps or {}
 S.ChunkPoolFree = S.ChunkPoolFree or {}
-S.ShiftAbs = S.ShiftAbs or {}                  -- entity -> absolute pos, per re-base
+S.ShiftAbs = S.ShiftAbs or {}                  -- entity -> absolute pos, per migrate
 S.initialized = S.initialized or false
 S.nextChunkTick = 0
 S.nextShiftTick = 0
@@ -18,6 +19,28 @@ S.nextShiftTick = 0
 local TICK = 0.1                -- streaming/shift interval
 local FOOT_GRACE = 0.15         -- seconds to wait for ground before walking again
 local ZERO = Vector(0, 0, 0)
+local MERGE_DIST = 3000         -- this close and you get put in the same cell
+local BOUNDS = 15000            -- past this a local pos is about to leave the map
+
+local function cellOf(ent)
+	return ent.gtavCell or S.DefaultCell
+end
+
+local function cellKeyOf(ent)
+	return ent.WorldCellKey or GTAV.GetCellKey(S.DefaultCell)
+end
+
+local function absOf(ent)
+	return ent:GetPos() + cellOf(ent)
+end
+
+local function chunkKey(cx, cy, ckey)
+	return cx .. " " .. cy .. "|" .. ckey
+end
+
+local function inRange(v, r)
+	return math.abs(v.x) <= r and math.abs(v.y) <= r and math.abs(v.z) <= r
+end
 
 local function dbg()
 	local cv = GetConVar("gtav_sv_debug")
@@ -55,8 +78,8 @@ local function collectPhysicsObjects(ent)
 end
 
 -- absolute target so a double move cant happen
-local function MoveEntity(ent, absPos)
-	local target = absPos - S.Frame
+local function MoveEntity(ent, absPos, cell)
+	local target = absPos - cell
 	local remaining = target - ent:GetPos()
 
 	-- snapshot motion first, SetPos can halt it
@@ -143,55 +166,104 @@ local function CheckVehicle(ent)
 				log(string.format(
 					"VEHICLE DESYNC %s #%d object %d is %.0f from the body (abs %.0f %.0f)",
 					ent:GetClass(), ent:EntIndex(), i, math.sqrt(d2),
-					(body + S.Frame).x, (body + S.Frame).y))
+					(body + cellOf(ent)).x, (body + cellOf(ent)).y))
 			end
 		end
 	end
 end
 
-function S.SetFrame(newFrame)
-	newFrame = Vector(newFrame.x, newFrame.y, newFrame.z)
-	local old = S.Frame or ZERO
-	local delta = newFrame - old
-	if delta.x == 0 and delta.y == 0 and delta.z == 0 then
-		S.Frame = newFrame
-		return false
+local function labelCell(ent, cell)
+	if ent.IsGTAVGround then return end
+	GTAV.SetEntityCell(ent, cell)
+	for _, child in ipairs(ent:GetChildren()) do labelCell(child, cell) end
+	if ent:IsPlayer() then
+		for _, wep in ipairs(ent:GetWeapons()) do GTAV.SetEntityCell(wep, cell) end
 	end
+end
 
-	S.Frame = newFrame
+-- player count per cell, skip lets a mover not count itself
+local function occupants(skip)
+	local occ = {}
+	for _, ply in ipairs(player.GetAll()) do
+		if not (skip and skip[ply]) then
+			local key = cellKeyOf(ply)
+			occ[key] = (occ[key] or 0) + 1
+		end
+	end
+	return occ
+end
+
+-- everything that has to move with this entity
+local function gather(ent, set)
+	set = set or {}
+	local function add(e)
+		if not IsValid(e) or set[e] or e:IsWorld() or e.IsGTAVGround then return end
+		set[e] = true
+		if constraint.HasConstraints(e) then
+			for _, other in pairs(constraint.GetAllConstrainedEntities(e)) do add(other) end
+		end
+		if e.GetDriver then add(e:GetDriver()) end
+		for _, child in ipairs(e:GetChildren()) do
+			if child:IsPlayer() or child.GetDriver then add(child) end
+		end
+	end
+	add(ent)
+	if ent:IsPlayer() then
+		add((AttachmentRoot(ent)))
+		add(S.Held[ent])
+	end
+	return set
+end
+
+-- nobody stays behind so the whole cell comes along, cheap and nothing rebuilds
+function S.MigrateCell(old, new)
+	local oldKey, newKey = GTAV.GetCellKey(old), GTAV.GetCellKey(new)
+	local wasDefault = oldKey == GTAV.GetCellKey(S.DefaultCell)
 	local t0 = SysTime()
 
 	-- snapshot before anything moves, dont touch this
 	local absOfOld = S.ShiftAbs
 	for k in pairs(absOfOld) do absOfOld[k] = nil end
 	for _, ent in ipairs(ents.GetAll()) do
-		if IsValid(ent) and not ent:IsWorld() and not ent.IsGTAVGround then
+		if IsValid(ent) and not ent:IsWorld() and not ent.IsGTAVGround and cellKeyOf(ent) == oldKey then
 			absOfOld[ent] = ent:GetPos() + old
 		end
 	end
-	local snap = function(ent)
-		return absOfOld[ent] or (ent:GetPos() + old)
-	end
 
+	local keys = {}
+	for key, ent in pairs(S.ActiveChunks) do
+		if IsValid(ent) and ent.CellKey == oldKey then keys[#keys + 1] = key end
+	end
 	local groundMoved = 0
-	for _, ent in pairs(S.ActiveChunks) do
-		if IsValid(ent) and ent.AbsOrigin then
+	for _, key in ipairs(keys) do
+		local ent = S.ActiveChunks[key]
+		local nk = chunkKey(ent:GetPieceX(), ent:GetPieceY(), newKey)
+		S.ActiveChunks[key] = nil
+		if S.ActiveChunks[nk] or not inRange(ent.AbsOrigin - new, BOUNDS) then
+			ent:Remove()
+		else
 			-- no SetEntityCell here, CollisionRulesChanged hitches
-			ent:SetNW2Vector("WorldCell", newFrame)
-			ent:MoveTo(ent.AbsOrigin - newFrame)
+			ent.CellKey = newKey
+			ent.gtavCell = new
+			ent.WorldCellKey = newKey
+			ent:SetNW2Vector("WorldCell", new)
+			ent:MoveTo(ent.AbsOrigin - new)
+			S.ActiveChunks[nk] = ent
 			groundMoved = groundMoved + 1
 		end
 	end
 	local t1 = SysTime()
 
-	for _, ply in ipairs(player.GetAll()) do
-		if IsValid(ply) then
-			GTAV.SetEntityCell(ply, newFrame)
-			local root, scripted = AttachmentRoot(ply)
+	if wasDefault then S.DefaultCell = Vector(new.x, new.y, new.z) end
+
+	for ent, abs in pairs(absOfOld) do
+		if ent:IsPlayer() and IsValid(ent) then
+			labelCell(ent, new)
+			local root, scripted = AttachmentRoot(ent)
 			if scripted and IsValid(root) then
-				MoveEntity(root, snap(root))
-			else
-				ply:SetPos(snap(ply) - newFrame)
+				MoveEntity(root, absOfOld[root] or (root:GetPos() + old), new)
+			elseif not ent:InVehicle() then
+				ent:SetPos(abs - new)
 			end
 		end
 	end
@@ -199,45 +271,80 @@ function S.SetFrame(newFrame)
 
 	local propsMoved = 0
 	local multiMoved = 0
-	for _, ent in ipairs(ents.GetAll()) do
-		if IsValid(ent) and not ent:IsPlayer() and not ent:IsWorld()
-			and not ent.IsGTAVGround and not IsValid(ent:GetParent())
+	for ent, abs in pairs(absOfOld) do
+		if IsValid(ent) and not ent:IsPlayer() and not IsValid(ent:GetParent())
 			and (not ent:IsDormant() or ent:IsVehicle()
 				or ent.IsSimfphyscar or ent.IsGlideVehicle) then
-			local physMoved = MoveEntity(ent, snap(ent))
-			local isVehicle = ent:IsVehicle()
-				or ent.IsSimfphyscar or ent.IsGlideVehicle
-			if isVehicle then CheckVehicle(ent) end
-			if physMoved > 1 or isVehicle then
-				multiMoved = multiMoved + 1
-				log(string.format("shifted %s (%d physics objects, abs %.0f %.0f)",
-					ent:GetClass(), physMoved, (ent:GetPos() + newFrame).x,
-					(ent:GetPos() + newFrame).y))
+			if inRange(abs - new, BOUNDS) then
+				local physMoved = MoveEntity(ent, abs, new)
+				local isVehicle = ent:IsVehicle()
+					or ent.IsSimfphyscar or ent.IsGlideVehicle
+				if isVehicle then CheckVehicle(ent) end
+				if physMoved > 1 or isVehicle then
+					multiMoved = multiMoved + 1
+					log(string.format("shifted %s (%d physics objects, abs %.0f %.0f)",
+						ent:GetClass(), physMoved, abs.x, abs.y))
+				end
+				if ent.WorldCellKey then labelCell(ent, new) end
+				propsMoved = propsMoved + 1
+			else
+				-- too far to come along, stays where it is
+				labelCell(ent, old)
 			end
-			if ent.WorldCellKey then
-				GTAV.SetEntityCell(ent, newFrame)
-			end
-			propsMoved = propsMoved + 1
 		end
 	end
 	local t3 = SysTime()
 
-	log(string.format("frame %s -> %s (%.2fms: ground %d/%.2fms, players %.2fms, props %d multi %d/%.2fms)",
-		GTAV.GetCellKey(old), GTAV.GetCellKey(newFrame),
-		(t3 - t0) * 1000,
+	log(string.format("cell %s -> %s (%.2fms: ground %d/%.2fms, players %.2fms, props %d multi %d/%.2fms)",
+		oldKey, newKey, (t3 - t0) * 1000,
 		groundMoved, (t1 - t0) * 1000,
 		(t2 - t1) * 1000,
 		propsMoved, multiMoved, (t3 - t2) * 1000))
+end
+
+-- move a set of entities into a cell, abs position stays the same
+local function moveSet(set, cell)
+	local abs = {}
+	for ent in pairs(set) do abs[ent] = absOf(ent) end
+	for ent, pos in pairs(abs) do
+		if IsValid(ent) then
+			labelCell(ent, cell)
+			if not IsValid(ent:GetParent()) then
+				if ent:IsPlayer() then
+					if not ent:InVehicle() then ent:SetPos(pos - cell) end
+				else
+					MoveEntity(ent, pos, cell)
+				end
+			end
+		end
+	end
+end
+
+-- per player, this is the whole multiplayer fix
+function S.Rebase(ply, cell)
+	local oldKey, newKey = cellKeyOf(ply), GTAV.GetCellKey(cell)
+	if oldKey == newKey then return false end
+
+	local set = gather(ply)
+	local occ = occupants(set)
+	if not occ[oldKey] and not occ[newKey] then
+		S.MigrateCell(cellOf(ply), cell)
+		-- the migrate only walks whats in the old cell
+		for ent in pairs(set) do
+			if IsValid(ent) and cellKeyOf(ent) ~= newKey then
+				moveSet({[ent] = true}, cell)
+			end
+		end
+	else
+		moveSet(set, cell)
+	end
 	return true
 end
 
 function S.Place(ent, abs)
-	ent:SetPos(abs - S.Frame)
-	return abs - S.Frame
-end
-
-local function absOf(ent)
-	return ent:GetPos() + (S.Frame or ZERO)
+	local l = abs - cellOf(ent)
+	ent:SetPos(l)
+	return l
 end
 
 
@@ -252,8 +359,9 @@ local SPAWN_PER_TICK = 3      -- hard cap, whatever the budget says
 local LEAD_SECONDS = 1.5
 local LEAD_MAX = 4096
 
-function S.SpawnChunk(cx, cy)
-	local key = cx .. " " .. cy
+function S.SpawnChunk(cx, cy, cell)
+	local ckey = GTAV.GetCellKey(cell)
+	local key = chunkKey(cx, cy, ckey)
 	if S.ActiveChunks[key] then return S.ActiveChunks[key] end
 	if not canHaveGround(cx, cy) then return nil end
 
@@ -269,12 +377,18 @@ function S.SpawnChunk(cx, cy)
 	end
 	if not IsValid(ent) then return nil end
 
+	-- no model = client treats it as not solid and prediction falls through
+	-- singleplayer never noticed. infmap uses a couch
+	ent:SetModel("models/hunter/blocks/cube025x025x025.mdl")
 	ent:SetPieceX(cx)
 	ent:SetPieceY(cy)
 	ent.AbsOrigin = absOrigin
 	ent.gtavBuilt = false
-	ent:SetNW2Vector("WorldCell", S.Frame)
-	ent:SetPos(absOrigin - S.Frame)
+	ent.CellKey = ckey
+	ent.gtavCell = Vector(cell.x, cell.y, cell.z)
+	ent.WorldCellKey = ckey
+	ent:SetNW2Vector("WorldCell", cell)
+	ent:SetPos(absOrigin - cell)
 	ent:SetAngles(angle_zero)
 	ent:Spawn()
 	if not ent.gtavBuilt then ent:Build() end
@@ -292,9 +406,9 @@ function S.UnloadChunk(key)
 	end
 end
 
-local function underChunkKey(abs)
+local function underChunkKey(abs, ckey)
 	local ps = GTAV.Config.PHYS_CHUNK_SIZE
-	return math.floor(abs.x / ps) .. " " .. math.floor(abs.y / ps)
+	return chunkKey(math.floor(abs.x / ps), math.floor(abs.y / ps), ckey)
 end
 
 local function HoldPlayer(ply, ready, now)
@@ -340,6 +454,8 @@ function S.ThinkChunks()
 		if IsValid(ply) and ply:Alive() then
 			anyPlayer = true
 			local abs = absOf(ply)
+			local cell = cellOf(ply)
+			local ckey = cellKeyOf(ply)
 			local vel = ply:GetVelocity()
 			local lead = radius + math.min(vel:Length() * LEAD_SECONDS, LEAD_MAX)
 			local px = math.floor((abs.x + vel.x * LEAD_SECONDS) / ps)
@@ -353,20 +469,19 @@ function S.ThinkChunks()
 			for cx = x0, x1 do
 				for cy = y0, y1 do
 					if canHaveGround(cx, cy) then
-						local key = cx .. " " .. cy
+						local key = chunkKey(cx, cy, ckey)
 						local d = math.abs(cx - px) + math.abs(cy - py)
 						local w = wanted[key]
 						if w then
 							if d < w.dist then w.dist = d end
 						else
-							wanted[key] = {cx = cx, cy = cy, dist = d}
+							wanted[key] = {cx = cx, cy = cy, cell = cell, dist = d}
 						end
 					end
 				end
 			end
 
-			local ukey = underChunkKey(abs)
-			local ready = S.ActiveChunks[ukey] ~= nil
+			local ready = S.ActiveChunks[underChunkKey(abs, ckey)] ~= nil
 			if not canHaveGround(math.floor(abs.x / ps), math.floor(abs.y / ps)) then
 				ready = true -- no data here: nothing to wait for
 			end
@@ -392,7 +507,7 @@ function S.ThinkChunks()
 			break
 		end
 		local w = missing[i]
-		S.SpawnChunk(w.cx, w.cy)
+		S.SpawnChunk(w.cx, w.cy, w.cell)
 		spawned = spawned + 1
 	end
 	if spawned > 1 or (SysTime() - t0) * 1000 > 20 then
@@ -463,11 +578,45 @@ local function HasOccupant(ent)
 	return false
 end
 
+-- whoever made it decides the cell
+local function assignCell(ent)
+	if not IsValid(ent) or ent.gtavCell or ent.IsGTAVGround or ent:IsPlayer() or ent:IsWorld() then return end
+	local owner = ent:GetOwner()
+	if not IsValid(owner) then owner = ent:GetCreator() end
+	if not IsValid(owner) then owner = ent:GetParent() end
+	if IsValid(owner) and owner.gtavCell then
+		labelCell(ent, owner.gtavCell)
+	end
+end
+
+-- nobody home in its cell, hand it to whoever walked up to it
+local function adoptProp(ent, abs, occ)
+	if occ[cellKeyOf(ent)] then return end
+	local best, bestD = nil, MERGE_DIST * MERGE_DIST
+	for _, ply in ipairs(player.GetAll()) do
+		if ply:Alive() then
+			local d = absOf(ply):DistToSqr(abs)
+			if d < bestD and inRange(abs - cellOf(ply), GTAV.Config.KEEP_RADIUS) then
+				best, bestD = ply, d
+			end
+		end
+	end
+	if best then moveSet(gather(ent), cellOf(best)) end
+end
+
 function S.TrackProps(now)
+	local occ = occupants()
+	local cells = 0
+	for _ in pairs(occ) do cells = cells + 1 end
+	local multi = cells > 1
+	for _, ent in pairs(S.ActiveChunks) do
+		if not occ[ent.CellKey] then multi = true end
+	end
 	for _, ent in ipairs(ents.GetAll()) do
 		if not S.TrackedProps[ent] and Trackable(ent) then
 			S.TrackedProps[ent] = true
-			GTAV.SetEntityCell(ent, S.Frame)
+			assignCell(ent)
+			GTAV.SetEntityCell(ent, cellOf(ent))
 		end
 	end
 
@@ -478,8 +627,13 @@ function S.TrackProps(now)
 			local abs = absOf(ent)
 			local phys = ent:GetPhysicsObject()
 
+			adoptProp(ent, abs, occ)
+			if not occ[cellKeyOf(ent)] then multi = true end
+			if not inRange(ent:GetPos(), GTAV.Config.KEEP_RADIUS + 2048) then
+				moveSet(gather(ent), GTAV.SnapCell(abs))
+			end
 
-			local key = underChunkKey(abs)
+			local key = underChunkKey(abs, cellKeyOf(ent))
 			local cx, cy = GTAV.GetPhysChunkCoord(abs)
 			if canHaveGround(cx, cy) and not S.ActiveChunks[key] then
 				-- never freeze an occupied car
@@ -509,16 +663,24 @@ function S.TrackProps(now)
 			end
 		end
 	end
+	GTAV.MultiCell = multi
 end
 
 
 function S.PlacePlayerAtSpawn(ply)
 	local spawn = GTAV.MapData.spawn or Vector(0, 0, 500)
-	local frame = GTAV.SnapCell(spawn)
+	local cell = GTAV.SnapCell(spawn)
 
-	if frame ~= S.Frame then S.SetFrame(frame) end
+	-- one spawn point and no info_player_starts, spread out or you spawn stuck
+	local n = #player.GetAll() - 1
+	if n > 0 then
+		local i = ply:EntIndex() * 2.4
+		local r = 56 * math.sqrt(n)
+		spawn = spawn + Vector(math.cos(i) * r, math.sin(i) * r, 0)
+	end
 
-	GTAV.SetEntityCell(ply, S.Frame)
+	S.Rebase(ply, cell)
+	labelCell(ply, cell)
 	S.Place(ply, spawn)
 
 	local ang = GTAV.MapData.spawn_angles
@@ -543,38 +705,46 @@ function S.ResetPlayer(ply)
 	log("placed " .. ply:Nick() .. " at abs " .. tostring(GTAV.MapData.spawn))
 end
 
-function S.ShiftFrame(now)
-	if now < (S.ShiftBlock or 0) then return end
-
-	local ref
-	for _, ply in ipairs(player.GetAll()) do
-		if IsValid(ply) and ply:Alive() then
-			if ply:GetMoveType() ~= MOVETYPE_NOCLIP then
-				ref = ply
-				break
+-- two friends can land in different cells on the same spot, walk through each other, cant shoot
+function S.MergePlayers()
+	local all = player.GetAll()
+	local keep = GTAV.Config.KEEP_RADIUS - 256
+	for i = 1, #all do
+		local a = all[i]
+		for j = i + 1, #all do
+			local b = all[j]
+			if a:Alive() and b:Alive() and cellKeyOf(a) ~= cellKeyOf(b) then
+				local pa, pb = absOf(a), absOf(b)
+				if pa:DistToSqr(pb) < MERGE_DIST * MERGE_DIST then
+					if inRange(pb - cellOf(a), keep) then
+						S.Rebase(b, cellOf(a))
+					elseif inRange(pa - cellOf(b), keep) then
+						S.Rebase(a, cellOf(b))
+					end
+				end
 			end
-			ref = ref or ply
 		end
-	end
-	if not ref then return end
-
-	local abs = absOf(ref)
-
-	-- safety net, there is no floor
-	if abs.z < -500000 then
-		S.ResetPlayer(ref)
-		return
-	end
-
-	local keep = GTAV.Config.KEEP_RADIUS
-	local l = ref:GetPos()
-	if math.abs(l.x) > keep or math.abs(l.y) > keep or math.abs(l.z) > keep then
-		S.SetFrame(GTAV.SnapCell(abs))
 	end
 end
 
+function S.ShiftPlayers(now)
+	local keep = GTAV.Config.KEEP_RADIUS
+	for _, ply in ipairs(player.GetAll()) do
+		if IsValid(ply) and ply:Alive() and now >= (ply.gtavShiftBlock or 0) then
+			local abs = absOf(ply)
+			-- safety net, there is no floor
+			if abs.z < -500000 then
+				S.ResetPlayer(ply)
+			elseif not inRange(ply:GetPos(), keep) then
+				S.Rebase(ply, GTAV.SnapCell(abs))
+			end
+		end
+	end
+	S.MergePlayers()
+end
+
 function S.Teleport(ply, abs)
-	local frame = GTAV.SnapCell(abs)
+	local cell = GTAV.SnapCell(abs)
 
 	local root, scripted
 	local vehTarget
@@ -586,10 +756,9 @@ function S.Teleport(ply, abs)
 		end
 	end
 
-	if frame ~= S.Frame then S.SetFrame(frame) end
-
 	if IsValid(ply) then
-		GTAV.SetEntityCell(ply, S.Frame)
+		S.Rebase(ply, cell)
+		labelCell(ply, cell)
 		if not scripted then
 			S.Place(ply, abs)
 			ply:SetLocalVelocity(ZERO)
@@ -598,7 +767,7 @@ function S.Teleport(ply, abs)
 		ply.gtavFootReady = nil
 		ply.gtavHoldStart = nil
 
-		if vehTarget then MoveEntity(root, vehTarget) end
+		if vehTarget then MoveEntity(root, vehTarget, cell) end
 	end
 	S.ThinkChunks()
 end
@@ -627,12 +796,12 @@ function S.Stats()
 	local now = CurTime()
 	if now - S.lastStats < 5 then return end
 	S.lastStats = now
-	local ply = player.GetAll()[1]
-	local abs = IsValid(ply) and absOf(ply) or ZERO
-	print(string.format("[GTAV] frame=%s chunks=%d playerAbs=%.0f %.0f %.0f mt=%d",
-		GTAV.GetCellKey(S.Frame), table.Count(S.ActiveChunks),
-		abs.x, abs.y, abs.z,
-		IsValid(ply) and ply:GetMoveType() or -1))
+	print(string.format("[GTAV] chunks=%d cells=%d", table.Count(S.ActiveChunks), table.Count(occupants())))
+	for _, ply in ipairs(player.GetAll()) do
+		local abs = absOf(ply)
+		print(string.format("  %s cell=%s abs=%.0f %.0f %.0f mt=%d", ply:Nick(), cellKeyOf(ply),
+			abs.x, abs.y, abs.z, ply:GetMoveType()))
+	end
 end
 
 function S.Think()
@@ -641,7 +810,7 @@ function S.Think()
 
 	if now >= S.nextShiftTick then
 		S.nextShiftTick = now + TICK
-		S.ShiftFrame(now)
+		S.ShiftPlayers(now)
 	end
 
 	if now >= S.nextChunkTick then
@@ -668,15 +837,58 @@ function S.Initialize()
 	print("[GTAV] Server initializing...")
 
 	local spawn = GTAV.MapData.spawn or Vector(0, 0, 200)
-	S.Frame = GTAV.SnapCell(spawn)
-	print("[GTAV] Frame origin: " .. GTAV.GetCellKey(S.Frame))
+	S.DefaultCell = GTAV.SnapCell(spawn)
+	print("[GTAV] Default cell: " .. GTAV.GetCellKey(S.DefaultCell))
 
-	hook.Add("ShouldCollide", "GTAV_CellCollision", GTAV.ShouldCollide)
 	hook.Add("PlayerSpawn", "GTAV_PlayerSpawn", S.OnPlayerSpawn)
 	hook.Add("EntityRemoved", "GTAV_EntityRemoved", S.OnEntityRemoved)
 	hook.Add("Think", "GTAV_Stream", S.Think)
 
+	-- things in other cells cant touch you
+	local function crossCell(a, b)
+		if not IsValid(a) or not IsValid(b) then return false end
+		local ka, kb = a.WorldCellKey, b.WorldCellKey
+		return ka and kb and ka ~= kb
+	end
+	local function denyCross(a, b)
+		if crossCell(a, b) then return false end
+	end
+	hook.Add("EntityTakeDamage", "GTAV_CellDamage", function(target, dmg)
+		if crossCell(target, dmg:GetInflictor()) or crossCell(target, dmg:GetAttacker()) then return true end
+	end)
+	hook.Add("PlayerCanPickupWeapon", "GTAV_CellPickup", denyCross)
+	hook.Add("PlayerCanPickupItem", "GTAV_CellPickup", denyCross)
+	hook.Add("GravGunPickupAllowed", "GTAV_CellPickup", denyCross)
+	hook.Add("PhysgunPickup", "GTAV_CellPickup", denyCross)
+	hook.Add("PlayerUse", "GTAV_CellPickup", denyCross)
+
+	-- carried stuff crosses cells with you
+	local function pickup(ply, ent) S.Held[ply] = ent end
+	local function drop(ply) S.Held[ply] = nil end
+	hook.Add("OnPhysgunPickup", "GTAV_Held", pickup)
+	hook.Add("PhysgunDrop", "GTAV_Held", drop)
+	hook.Add("GravGunOnPickedUp", "GTAV_Held", pickup)
+	hook.Add("GravGunOnDropped", "GTAV_Held", drop)
+	hook.Add("OnPlayerPhysicsPickup", "GTAV_Held", pickup)
+	hook.Add("OnPlayerPhysicsDrop", "GTAV_Held", drop)
+
+	hook.Add("OnEntityCreated", "GTAV_AssignCell", function(ent)
+		timer.Simple(0, function() assignCell(ent) end)
+	end)
+	local function spawned(ply, a, b)
+		local ent = isentity(a) and a or b
+		if IsValid(ent) and ply.gtavCell then labelCell(ent, ply.gtavCell) end
+	end
+	hook.Add("PlayerSpawnedProp", "GTAV_AssignCell", spawned)
+	hook.Add("PlayerSpawnedEffect", "GTAV_AssignCell", spawned)
+	hook.Add("PlayerSpawnedRagdoll", "GTAV_AssignCell", spawned)
+	hook.Add("PlayerSpawnedNPC", "GTAV_AssignCell", spawned)
+	hook.Add("PlayerSpawnedSENT", "GTAV_AssignCell", spawned)
+	hook.Add("PlayerSpawnedVehicle", "GTAV_AssignCell", spawned)
+	hook.Add("PlayerSpawnedSWEP", "GTAV_AssignCell", spawned)
+
 	concommand.Add("gtav_tp", function(ply, cmd, args)
+		if IsValid(ply) and not ply:IsAdmin() then return end
 		local x, y, z = tonumber(args[1]), tonumber(args[2]), tonumber(args[3])
 		if not x or not y then
 			print("[GTAV] usage: gtav_tp <x> <y> [z]  (absolute world coordinates)")
@@ -686,8 +898,8 @@ function S.Initialize()
 		for _, p in ipairs(targets) do
 			local abs = Vector(x, y, z or ((absOf(p).z)))
 			S.Teleport(p, abs)
-			print(string.format("[GTAV] teleported %s to %s (frame %s)", p:Nick(), tostring(abs),
-				GTAV.GetCellKey(S.Frame)))
+			print(string.format("[GTAV] teleported %s to %s (cell %s)", p:Nick(), tostring(abs),
+				cellKeyOf(p)))
 		end
 	end)
 
@@ -696,30 +908,32 @@ function S.Initialize()
 		local y = net.ReadFloat()
 		local z = net.ReadFloat()
 		local hasZ = net.ReadBool()
-		if not IsValid(ply) then return end
+		if not IsValid(ply) or not ply:IsAdmin() then return end
 		local abs = Vector(x, y, hasZ and z or absOf(ply).z)
 		S.Teleport(ply, abs)
-		print(string.format("[GTAV] %s teleported to %s (frame %s)", ply:Nick(), tostring(abs),
-			GTAV.GetCellKey(S.Frame)))
+		print(string.format("[GTAV] %s teleported to %s (cell %s)", ply:Nick(), tostring(abs),
+			cellKeyOf(ply)))
 	end)
 
 	net.Receive("GTAV_Respawn", function(len, ply)
-		if IsValid(ply) then S.ResetPlayer(ply) end
+		if not IsValid(ply) or CurTime() < (ply.gtavNextRespawn or 0) then return end
+		ply.gtavNextRespawn = CurTime() + 2
+		S.ResetPlayer(ply)
 	end)
 
 	concommand.Add("gtav_frame", function(ply)
-		local f = S.Frame
-		print(string.format("[GTAV] frame %s (%.0f %.0f %.0f) chunks=%d",
-			GTAV.GetCellKey(f), f.x, f.y, f.z, table.Count(S.ActiveChunks)))
+		print(string.format("[GTAV] default cell %s chunks=%d", GTAV.GetCellKey(S.DefaultCell),
+			table.Count(S.ActiveChunks)))
 		for _, p in ipairs(player.GetAll()) do
-			print(string.format("  %s local=%.0f %.0f %.0f abs=%.0f %.0f %.0f mt=%d",
-				p:Nick(), p:GetPos().x, p:GetPos().y, p:GetPos().z,
+			print(string.format("  %s cell=%s local=%.0f %.0f %.0f abs=%.0f %.0f %.0f mt=%d",
+				p:Nick(), cellKeyOf(p), p:GetPos().x, p:GetPos().y, p:GetPos().z,
 				absOf(p).x, absOf(p).y, absOf(p).z, p:GetMoveType()))
 		end
 	end)
 
 	concommand.Add("gtav_shift", function(ply, cmd, args)
 		if not GTAV.MapData.current then return end
+		if not IsValid(ply) or not ply:IsAdmin() then return end
 		local axis = string.lower(args[1] or "x")
 		local sign = 1
 		if axis:sub(1, 1) == "-" then
@@ -733,35 +947,26 @@ function S.Initialize()
 			dir = Vector(0, 0, sign)
 		end
 
-		local abs = {}
-		for _, p in ipairs(player.GetAll()) do abs[p] = absOf(p) end
-
+		local abs = absOf(ply)
 		local t0 = SysTime()
-		S.SetFrame(S.Frame + dir * GTAV.Config.CELL_SIZE)
-		S.ShiftBlock = CurTime() + 5
-		for _, p in ipairs(player.GetAll()) do
-			GTAV.SetEntityCell(p, S.Frame)
-			local root, scripted = AttachmentRoot(p)
-			if scripted and IsValid(root) then
-				MoveEntity(root, absOf(root))
-			else
-				S.Place(p, abs[p])
-				p:SetLocalVelocity(ZERO)
-			end
-			p.gtavFootHeld = nil
-			p.gtavFootReady = nil
+		S.Rebase(ply, cellOf(ply) + dir * GTAV.Config.CELL_SIZE)
+		ply.gtavShiftBlock = CurTime() + 5
+		local root, scripted = AttachmentRoot(ply)
+		if not (scripted and IsValid(root)) then
+			S.Place(ply, abs)
+			ply:SetLocalVelocity(ZERO)
 		end
+		ply.gtavFootHeld = nil
+		ply.gtavFootReady = nil
 		S.ThinkChunks()
-		print(string.format("[GTAV] gtav_shift %s: frame %s, %d players, %.2fms",
-			tostring(dir), GTAV.GetCellKey(S.Frame), table.Count(abs),
+		print(string.format("[GTAV] gtav_shift %s: cell %s, %.2fms", tostring(dir), cellKeyOf(ply),
 			(SysTime() - t0) * 1000))
 	end)
 
 	concommand.Add("gtav_freecam", function(ply)
-		for _, p in ipairs(player.GetAll()) do
-			p:SetMoveType(MOVETYPE_NOCLIP)
-			p.gtavFootHeld = nil
-		end
+		if not IsValid(ply) or not ply:IsAdmin() then return end
+		ply:SetMoveType(MOVETYPE_NOCLIP)
+		ply.gtavFootHeld = nil
 	end)
 
 	timer.Simple(0.5, function()
@@ -784,22 +989,21 @@ hook.Add("Think", "GTAV_GroundProbe", function()
 	if CurTime() - lastProbeTime < 2 then return end
 	lastProbeTime = CurTime()
 
-	local ply = player.GetAll()[1]
-	if not IsValid(ply) then return end
-
 	local traceLine = GTAV.Trace and GTAV.Trace.RealTraceLine
 	if not traceLine then return end
 
-	local abs = absOf(ply)
-	local tr = traceLine({
-		start = ply:GetPos() + Vector(0, 0, 8),
-		endpos = ply:GetPos() - Vector(0, 0, 600),
-		filter = ply,
-		mask = MASK_SOLID,
-	})
+	for _, ply in ipairs(player.GetAll()) do
+		local abs = absOf(ply)
+		local tr = traceLine({
+			start = ply:GetPos() + Vector(0, 0, 8),
+			endpos = ply:GetPos() - Vector(0, 0, 600),
+			filter = ply,
+			mask = MASK_SOLID,
+		})
 
-	local hitClass = IsValid(tr.Entity) and tr.Entity:GetClass() or "none"
-	print(string.format("[GTAV] probe: hit=%s ent=%s absZ=%.1f localZ=%.1f chunks=%d mt=%d",
-		tostring(tr.Hit), hitClass, abs.z, ply:GetPos().z,
-		table.Count(S.ActiveChunks), ply:GetMoveType()))
+		local hitClass = IsValid(tr.Entity) and tr.Entity:GetClass() or "none"
+		print(string.format("[GTAV] probe %s: hit=%s ent=%s absZ=%.1f localZ=%.1f chunks=%d mt=%d",
+			ply:Nick(), tostring(tr.Hit), hitClass, abs.z, ply:GetPos().z,
+			table.Count(S.ActiveChunks), ply:GetMoveType()))
+	end
 end)

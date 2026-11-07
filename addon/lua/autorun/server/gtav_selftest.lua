@@ -7,7 +7,7 @@ local function park(ply)
 end
 
 concommand.Add("gtav_st_goto", function(ply, _, args)
-	if not IsValid(ply) or #args < 3 then return end
+	if not IsValid(ply) or not ply:IsAdmin() or #args < 3 then return end
 	local x, y, z = tonumber(args[1]), tonumber(args[2]), tonumber(args[3])
 	if not x or not y or not z then return end
 
@@ -17,11 +17,6 @@ concommand.Add("gtav_st_goto", function(ply, _, args)
 	-- absolute, plain SetPos lands a frame off
 	if S and S.Teleport then
 		S.Teleport(ply, target)
-	elseif S and S.Place then
-		local frame = GTAV.SnapCell(target)
-		if S.SetFrame and frame ~= S.Frame then S.SetFrame(frame) end
-		GTAV.SetEntityCell(ply, S.Frame)
-		S.Place(ply, target)
 	else
 		ErrorNoHalt("[GTAV selftest] gtav_st_goto: no placement API, refusing\n")
 		return
@@ -42,5 +37,6 @@ concommand.Add("gtav_st_goto", function(ply, _, args)
 end)
 
 concommand.Add("gtav_st_park", function(ply)
+	if not IsValid(ply) or not ply:IsAdmin() then return end
 	park(ply)
 end)

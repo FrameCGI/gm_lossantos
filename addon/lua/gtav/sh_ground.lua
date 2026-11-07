@@ -36,9 +36,17 @@ function ENT:TargetPos()
 	return self:ChunkAbsOrigin() - self:GetNW2Vector("WorldCell", ZERO)
 end
 
+function ENT:InMyCell()
+	if SERVER then return true end
+	local me = LocalPlayer()
+	if not IsValid(me) then return false end
+	return self:GetNW2Vector("WorldCell", ZERO) == me:GetNW2Vector("WorldCell", ZERO)
+end
+
 function ENT:Build()
 	if self.gtavBuilt then return true end
 	if not GTAV.MapData.current then return false end
+	if not self:InMyCell() then return false end
 
 	local cx, cy = self:GetPieceX(), self:GetPieceY()
 
@@ -58,12 +66,16 @@ function ENT:Build()
 	self:SetSolid(SOLID_VPHYSICS)
 	self:SetMoveType(MOVETYPE_NONE)
 	self:EnableCustomCollisions(true)
+	self:AddSolidFlags(FSOLID_FORCE_WORLD_ALIGNED)
+	self:AddFlags(FL_STATICPROP)
 	self:DrawShadow(false)
 
 	local phys = self:GetPhysicsObject()
 	if IsValid(phys) then
 		phys:EnableMotion(false)
 		phys:EnableGravity(false)
+		local mins, maxs = phys:GetAABB()
+		if mins and maxs then self:SetCollisionBounds(mins, maxs) end
 		local target = self:TargetPos()
 		phys:SetPos(target)
 		phys:SetAngles(angle_zero)
@@ -110,7 +122,13 @@ GTAV.GroundBuildQueue = GTAV.GroundBuildQueue or {}
 
 function ENT:Think()
 	if CLIENT then
-		if not self.gtavBuilt and not self.gtavBuildQueued then
+		-- the engine eats client physics objects, no idea when. infmap rebuilds them too
+		if self.gtavBuilt and not IsValid(self:GetPhysicsObject()) then
+			self.gtavBuilt = false
+			self.gtavBuildTries = nil
+		end
+		-- other peoples cells have no reason to exist here
+		if not self.gtavBuilt and not self.gtavBuildQueued and self:InMyCell() then
 			self.gtavBuildQueued = true
 			local q = GTAV.GroundBuildQueue
 			q[#q + 1] = self
